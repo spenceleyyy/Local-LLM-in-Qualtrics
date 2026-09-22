@@ -68,22 +68,66 @@ Qualtrics.SurveyEngine.addOnload(function () {
     return (el.innerText || el.textContent || "").replace(/\s+\n/g, "\n").trim();
   }
 
+  // Find the visible label for an answer option (works in old and new layouts)
+  function labelFor(input, block) {
+    var lab = null;
+    if (input.id) {
+      try { lab = block.querySelector('label[for="' + CSS.escape(input.id) + '"]'); } catch (e) {}
+    }
+    if (!lab) lab = input.closest("label");
+    if (lab && textOf(lab)) return textOf(lab);
+    if (input.getAttribute("aria-label")) return input.getAttribute("aria-label");
+    var by = input.getAttribute("aria-labelledby");
+    if (by) {
+      var el = document.getElementById(by.split(" ")[0]);
+      if (el) return textOf(el);
+    }
+    return input.value || "";
+  }
+
+  // What the participant has chosen or typed in one question
+  function answersIn(block) {
+    var out = [];
+    var i, el;
+    var checked = block.querySelectorAll('input[type="radio"]:checked, input[type="checkbox"]:checked');
+    for (i = 0; i < checked.length; i++) {
+      var l = labelFor(checked[i], block);
+      if (l) out.push(l);
+    }
+    var texts = block.querySelectorAll('input[type="text"], input[type="number"], input:not([type]), textarea');
+    for (i = 0; i < texts.length; i++) {
+      el = texts[i];
+      if (widget.contains(el) || !el.value.trim()) continue;
+      out.push('"' + el.value.trim() + '"');
+    }
+    var selects = block.querySelectorAll("select");
+    for (i = 0; i < selects.length; i++) {
+      el = selects[i];
+      if (el.selectedIndex > 0) out.push(el.options[el.selectedIndex].text);
+    }
+    var ranges = block.querySelectorAll('input[type="range"], [role="slider"]');
+    for (i = 0; i < ranges.length; i++) {
+      el = ranges[i];
+      var v = el.value || el.getAttribute("aria-valuenow");
+      if (v !== null && v !== "") out.push("slider value " + v);
+    }
+    return out;
+  }
+
   function scrapePage() {
     var parts = [];
     var blocks = document.querySelectorAll(".QuestionOuter, .question");
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i];
       if (b.contains(widget) || widget.contains(b)) continue;
-      var t = textOf(b);
-      // add which options are currently selected
-      var checked = b.querySelectorAll("input:checked");
-      var picks = [];
-      for (var j = 0; j < checked.length; j++) {
-        var lab = b.querySelector('label[for="' + checked[j].id + '"]');
-        if (lab) picks.push(textOf(lab));
-      }
-      if (picks.length) t += "\n[Selected: " + picks.join("; ") + "]";
-      if (t) parts.push(t);
+      var textEl = b.querySelector(".QuestionText, .question-display") || b;
+      var t = textOf(textEl);
+      // include answer options too, so the model knows what the choices were
+      var body = b.querySelector(".QuestionBody, .question-content");
+      if (body && textEl !== b) t += "\n" + textOf(body);
+      var picks = answersIn(b);
+      t += "\nParticipant's answer: " + (picks.length ? picks.join("; ") : "(none yet)");
+      if (t.trim()) parts.push(t.trim());
     }
     // this question's own text (the prompt above the chat box)
     var own = questionEl && questionEl.querySelector(".QuestionText, .question-display");
@@ -197,9 +241,9 @@ Qualtrics.SurveyEngine.addOnload(function () {
       session_id: state.sessionId,
       survey_id: SURVEY_ID,
       condition: CONDITION,
-      message: text
+      message: text,
+      page_context: buildContext()   // re-read every message: picks up changed answers
     };
-    if (!state.sessionId) body.page_context = buildContext();  // first turn only
 
     fetch(SERVER_URL + "/chat", {
       method: "POST",

@@ -75,14 +75,16 @@ ngrok with a reserved domain, or a server with a fixed address.
 
 ## 5. How "what's on screen" reaches the model
 
-On the participant's first message, the widget collects:
+Every time the participant sends a message, the widget re-reads the page and sends:
 - the chat question's own text,
-- the text of every other question on the same page, with currently selected options,
+- every other question on the same page, with its answer options and a
+  `Participant's answer:` line (selected options, typed text, dropdowns, sliders),
 - `EXTRA_CONTEXT` (use piped text for answers from previous pages).
 
-The server puts this into the system prompt and stores it in the `sessions` table,
-so you know exactly what the model saw. Set `SCRAPE_PAGE = false` to rely only on
-`EXTRA_CONTEXT`.
+Because it's re-read each message, if the participant changes an answer mid-chat,
+the model sees the new one. The server logs the exact context used for each turn
+in the `page_context` column of `messages`. Set `SCRAPE_PAGE = false` to rely only
+on `EXTRA_CONTEXT`.
 
 ## 6. Your data
 

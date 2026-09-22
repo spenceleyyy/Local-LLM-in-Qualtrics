@@ -69,7 +69,9 @@ SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant embedded in a research s
 Keep replies short (2-4 sentences) and in plain language.
 Do not claim to be a human. Do not ask for personal identifying information.
 
-The participant is currently looking at this survey page:
+The participant is currently looking at this survey page. Lines starting
+with "Participant's answer:" show what they have selected or typed so far
+(this is updated every message, so trust the latest version):
 ---
 {page_context}
 ---
@@ -116,8 +118,19 @@ def db_connect():
         CREATE INDEX IF NOT EXISTS idx_msg_response ON messages(response_id);
         """
     )
+    # Upgrade older databases: store what was on screen at each user turn.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)")]
+    if "page_context" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN page_context TEXT")
     conn.commit()
     return conn
+
+
+def build_system_prompt(page_context, condition):
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        page_context=page_context or "(no page context provided)",
+        condition=condition or "none",
+    )
 
 
 conn: Optional[sqlite3.Connection] = None
@@ -203,35 +216,41 @@ async def chat(body: ChatIn, request: Request):
     message = message[:MAX_MESSAGE_CHARS]
 
     # ---- find or create the session ----
+    # The page context is sent with every message, so the model always sees
+    # the participant's *current* answers, not just what was there at first.
+    page_context = (body.page_context or "")[:MAX_CONTEXT_CHARS]
     session_id = body.session_id or str(uuid.uuid4())
+    user_ts = now_iso()
     async with db_lock:
         row = conn.execute(
-            "SELECT system_prompt, response_id FROM sessions WHERE session_id=?",
+            "SELECT response_id, condition, page_context FROM sessions "
+            "WHERE session_id=?",
             (session_id,),
         ).fetchone()
 
         if row is None:
-            page_context = (body.page_context or "")[:MAX_CONTEXT_CHARS]
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                page_context=page_context or "(no page context provided)",
-                condition=body.condition or "none",
-            )
+            condition = body.condition or ""
             conn.execute(
                 "INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
-                (session_id, body.response_id, body.survey_id, body.condition,
-                 page_context, system_prompt, now_iso()),
+                (session_id, body.response_id, body.survey_id, condition,
+                 page_context, build_system_prompt(page_context, condition),
+                 now_iso()),
             )
             conn.commit()
         else:
-            system_prompt, stored_rid = row
+            stored_rid, condition, first_context = row
             if stored_rid != body.response_id:
                 raise HTTPException(403, "Session does not match response")
+            if not page_context:          # older widget versions: keep first
+                page_context = first_context
 
         history = conn.execute(
             "SELECT role, content FROM messages "
             "WHERE session_id=? AND error IS NULL ORDER BY id",
             (session_id,),
         ).fetchall()
+
+    system_prompt = build_system_prompt(page_context, condition)
 
     turn = sum(1 for r, _ in history if r == "user") + 1
     if turn > MAX_TURNS:
@@ -274,12 +293,12 @@ async def chat(body: ChatIn, request: Request):
     latency_ms = int((time.perf_counter() - t0) * 1000)
 
     # ---- log both sides of the turn ----
-    user_ts = now_iso()
     async with db_lock:
         conn.execute(
             "INSERT INTO messages (session_id, response_id, turn, role, content,"
-            " created_at, error) VALUES (?,?,?,?,?,?,?)",
-            (session_id, body.response_id, turn, "user", message, user_ts, err),
+            " created_at, error, page_context) VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, body.response_id, turn, "user", message, user_ts, err,
+             page_context),
         )
         conn.execute(
             "INSERT INTO messages (session_id, response_id, turn, role, content,"
