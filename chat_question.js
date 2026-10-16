@@ -10,25 +10,38 @@ Qualtrics.SurveyEngine.addOnload(function () {
   var q = this;
 
   /* ===================== CONFIGURE THESE ===================== */
+  /* ---- same on every chat question ---- */
   var SERVER_URL = "https://YOUR-TUNNEL-OR-SERVER.example.com"; // no trailing slash
   var API_KEY    = "";           // must match API_KEY on the server (optional)
   var MIN_TURNS  = 3;            // participant messages required before Next unlocks (0 = none)
   var MAX_TURNS  = 20;           // input closes after this many messages
   var ASSISTANT_NAME = "Assistant";
-  var OPENING_MESSAGE = "Hi! Ask me anything about what you see on this page.";
+  var OPENING_MESSAGE = "";      // "" = assistant waits for the participant to speak first
 
-  // Qualtrics fills in piped text before this script runs.
+  /* ---- DIFFERENT ON EVERY CHAT QUESTION ---- */
+  // Which entry in the server's items.json this question is.
+  var ITEM_ID = "item_01";
+
+  // The participant's unassisted answer to the matching earlier question,
+  // as piped text. Get the exact code from Qualtrics: in the question
+  // editor, {A} Piped Text -> Survey Question -> pick the question ->
+  // Selected Choices. The QID is NOT the number shown on screen.
+  var PRIOR_ANSWER = "${q://QID1/ChoiceGroup/SelectedChoices}";
+
+  /* ---- assigned once per participant, in the Survey Flow ---- */
+  var CONDITION   = "${e://Field/condition}";   // assertive | process | control
   var RESPONSE_ID = "${e://Field/ResponseID}";
   var SURVEY_ID   = "${e://Field/SurveyID}";
-  var CONDITION   = "${e://Field/condition}";   // set in Survey Flow, or leave blank
 
-  // Anything else the model should know (e.g. answers from earlier pages).
-  // Example: "Earlier the participant rated trust as ${q://QID3/ChoiceGroup/SelectedChoices}."
+  // Anything else the model should know. Usually leave empty: the question
+  // text and options now come from items.json on the server.
   var EXTRA_CONTEXT = "";
 
-  // true = also read the text of the other questions on this page
-  var SCRAPE_PAGE = true;
-  /* =========================================================== */
+  // Reading the page is OFF by default for the experiment: the server
+  // already holds the question, the options and the prior answer, and
+  // scraping would let on-screen wording vary between conditions.
+  var SCRAPE_PAGE = false;
+  /* =========================================================== */  /* =========================================================== */
 
   var questionEl = (q.getQuestionContainer && q.getQuestionContainer()) ||
                    document.getElementById(q.questionId);
@@ -57,6 +70,8 @@ Qualtrics.SurveyEngine.addOnload(function () {
   }
 
   function persist() {
+    saveED("chat_log_" + ITEM_ID, JSON.stringify(state.log));
+    saveED("chat_turns_" + ITEM_ID, state.turns);
     saveED("chat_log", JSON.stringify(state.log));
     saveED("chat_turns", state.turns);
     saveED("chat_session_id", state.sessionId || "");
@@ -241,6 +256,8 @@ Qualtrics.SurveyEngine.addOnload(function () {
       session_id: state.sessionId,
       survey_id: SURVEY_ID,
       condition: CONDITION,
+      item_id: ITEM_ID,
+      prior_answer: PRIOR_ANSWER,
       message: text,
       page_context: buildContext()   // re-read every message: picks up changed answers
     };

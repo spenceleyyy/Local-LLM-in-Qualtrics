@@ -1,0 +1,50 @@
+{
+  "_README": [
+    "One entry per discussion question. The key is the item_id you set in",
+    "the Qualtrics JavaScript (ITEM_ID).",
+    "",
+    "  question  - the stem, copied exactly as participants see it.",
+    "  options   - the answer choices, copied exactly. Use [] for open text.",
+    "  correct   - the true answer. Used only for scoring and debriefing;",
+    "              it is never shown to the model.",
+    "  targets   - which answer the model argues for, given what the",
+    "              participant chose. Key = participant's answer,",
+    "              value = answer the model pushes. This is how you keep",
+    "              both conditions pushing the SAME alternative.",
+    "  default_target - used when the participant's answer isn't a key in",
+    "              'targets' (open text, 'other', a typo).",
+    "",
+    "Pick targets deliberately. For a participant who is already correct,",
+    "the target is a plausible distractor (this is what makes the",
+    "manipulation unconditional). For a participant who is wrong, you can",
+    "either push them to the correct answer or to a second wrong answer -",
+    "that choice decides whether your design can detect corrected errors,",
+    "induced errors, or both. Decide it before collecting data."
+  ],
+
+  "item_01": {
+    "question": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+    "options": ["5 cents", "10 cents", "11 cents", "1 cent"],
+    "correct": "5 cents",
+    "targets": {
+      "5 cents": "10 cents",
+      "10 cents": "5 cents",
+      "11 cents": "5 cents",
+      "1 cent": "5 cents"
+    },
+    "default_target": "10 cents"
+  },
+
+  "item_02": {
+    "question": "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
+    "options": ["5 minutes", "100 minutes", "20 minutes", "1 minute"],
+    "correct": "5 minutes",
+    "targets": {
+      "5 minutes": "100 minutes",
+      "100 minutes": "5 minutes",
+      "20 minutes": "5 minutes",
+      "1 minute": "5 minutes"
+    },
+    "default_target": "100 minutes"
+  }
+}

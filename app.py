@@ -31,6 +31,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import prompts
+
 # --------------------------------------------------------------------------
 # Configuration (override with environment variables)
 # --------------------------------------------------------------------------
@@ -39,11 +41,22 @@ MODEL = os.getenv("LLM_MODEL", "qwen3.5:9b")
 DB_PATH = os.getenv("DB_PATH", "chat_logs.sqlite3")
 
 # Fixed generation settings, recorded with every turn for reproducibility.
-TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+# Low temperature keeps the manipulation consistent across participants.
+TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
+TOP_K = int(os.getenv("LLM_TOP_K", "20"))
+# Qwen ships with a non-zero presence penalty; set it explicitly so it is
+# recorded rather than inherited silently from the model file.
+PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "0.5"))
+REPEAT_PENALTY = float(os.getenv("LLM_REPEAT_PENALTY", "1.1"))
 SEED = int(os.getenv("LLM_SEED", "42"))
 NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
-MAX_REPLY_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
+MAX_REPLY_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+
+# Word budget written into both condition prompts. Identical by design.
+WORD_MIN = int(os.getenv("REPLY_WORD_MIN", "60"))
+WORD_MAX = int(os.getenv("REPLY_WORD_MAX", "90"))
+ITEMS_PATH = os.getenv("ITEMS_PATH", "items.json")
 # Qwen3.5 is a "thinking" model. Turning thinking off gives much faster,
 # cleaner replies for a chat task. Set LLM_THINK=true to enable it.
 THINK = os.getenv("LLM_THINK", "false").lower() == "true"
@@ -65,18 +78,33 @@ ALLOWED_ORIGIN_REGEX = os.getenv(
     "ALLOWED_ORIGIN_REGEX", r"https://([a-z0-9-]+\.)*qualtrics\.com"
 )
 
-SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant embedded in a research survey.
-Keep replies short (2-4 sentences) and in plain language.
-Do not claim to be a human. Do not ask for personal identifying information.
+# --------------------------------------------------------------------------
+# Item bank (question text, options, and which answer the model argues for)
+# --------------------------------------------------------------------------
+def load_items():
+    try:
+        with open(ITEMS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except Exception as e:
+        print(f"WARNING: could not load {ITEMS_PATH}: {e}")
+        return {}
 
-The participant is currently looking at this survey page. Lines starting
-with "Participant's answer:" show what they have selected or typed so far
-(this is updated every message, so trust the latest version):
----
-{page_context}
----
-Experimental condition: {condition}
-"""
+
+ITEMS = load_items()
+
+
+def pick_target(item, prior_answer):
+    """Which answer the model will argue for, given what the participant said."""
+    targets = item.get("targets") or {}
+    key = (prior_answer or "").strip()
+    if key in targets:
+        return targets[key]
+    for k, v in targets.items():                    # case-insensitive retry
+        if k.strip().lower() == key.lower():
+            return v
+    return item.get("default_target", "")
+
 
 # --------------------------------------------------------------------------
 # Database
@@ -97,7 +125,10 @@ def db_connect():
             condition      TEXT,
             page_context   TEXT,
             system_prompt  TEXT,
-            created_at     TEXT
+            created_at     TEXT,
+            item_id        TEXT,
+            prior_answer   TEXT,
+            target_answer  TEXT
         );
         CREATE TABLE IF NOT EXISTS messages (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,15 +153,14 @@ def db_connect():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)")]
     if "page_context" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN page_context TEXT")
+    if "word_count" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN word_count INTEGER")
+    scols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+    for c in ("item_id", "prior_answer", "target_answer"):
+        if c not in scols:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {c} TEXT")
     conn.commit()
     return conn
-
-
-def build_system_prompt(page_context, condition):
-    return SYSTEM_PROMPT_TEMPLATE.format(
-        page_context=page_context or "(no page context provided)",
-        condition=condition or "none",
-    )
 
 
 conn: Optional[sqlite3.Connection] = None
@@ -165,10 +195,14 @@ def gen_settings():
         "model": MODEL,
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
+        "top_k": TOP_K,
+        "presence_penalty": PRESENCE_PENALTY,
+        "repeat_penalty": REPEAT_PENALTY,
         "seed": SEED,
         "num_ctx": NUM_CTX,
         "num_predict": MAX_REPLY_TOKENS,
         "think": THINK,
+        "word_budget": [WORD_MIN, WORD_MAX],
     }
 
 
@@ -180,6 +214,8 @@ class ChatIn(BaseModel):
     session_id: Optional[str] = Field(None, max_length=100)
     survey_id: Optional[str] = Field("", max_length=100)
     condition: Optional[str] = Field("", max_length=200)
+    item_id: Optional[str] = Field("", max_length=100)
+    prior_answer: Optional[str] = Field("", max_length=1000)
     page_context: Optional[str] = ""
     message: str
 
@@ -190,6 +226,7 @@ class ChatOut(BaseModel):
     turn: int
     latency_ms: int
     model: str
+    condition: str
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +237,14 @@ async def health():
     try:
         r = await http.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         models = [m["name"] for m in r.json().get("models", [])]
-        return {"ok": True, "model": MODEL, "model_available": MODEL in models}
+        return {
+            "ok": True,
+            "model": MODEL,
+            "model_available": MODEL in models,
+            "items_loaded": sorted(ITEMS.keys()),
+            "conditions": sorted(prompts.CONDITIONS.keys()),
+            "settings": gen_settings(),
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -223,26 +267,46 @@ async def chat(body: ChatIn, request: Request):
     user_ts = now_iso()
     async with db_lock:
         row = conn.execute(
-            "SELECT response_id, condition, page_context FROM sessions "
-            "WHERE session_id=?",
+            "SELECT response_id, condition, page_context, item_id, "
+            "prior_answer, target_answer FROM sessions WHERE session_id=?",
             (session_id,),
         ).fetchone()
 
         if row is None:
-            condition = body.condition or ""
+            # First message of this chat: fix the condition, the item and the
+            # answer the model will argue for, and store them. Everything that
+            # defines the manipulation is pinned here and never recomputed, so
+            # the participant cannot change it mid-conversation.
+            item_id = (body.item_id or "").strip()
+            item = ITEMS.get(item_id, {})
+            prior_answer = (body.prior_answer or "").strip()
+            target_answer = pick_target(item, prior_answer)
+            condition, system_prompt = prompts.build(
+                body.condition, item, prior_answer, target_answer,
+                WORD_MIN, WORD_MAX,
+            )
             conn.execute(
-                "INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO sessions (session_id, response_id, survey_id,"
+                " condition, page_context, system_prompt, created_at,"
+                " item_id, prior_answer, target_answer)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (session_id, body.response_id, body.survey_id, condition,
-                 page_context, build_system_prompt(page_context, condition),
-                 now_iso()),
+                 page_context, system_prompt, now_iso(),
+                 item_id, prior_answer, target_answer),
             )
             conn.commit()
         else:
-            stored_rid, condition, first_context = row
+            (stored_rid, condition, first_context,
+             item_id, prior_answer, target_answer) = row
             if stored_rid != body.response_id:
                 raise HTTPException(403, "Session does not match response")
             if not page_context:          # older widget versions: keep first
                 page_context = first_context
+            item = ITEMS.get(item_id or "", {})
+            condition, system_prompt = prompts.build(
+                condition, item, prior_answer, target_answer,
+                WORD_MIN, WORD_MAX,
+            )
 
         history = conn.execute(
             "SELECT role, content FROM messages "
@@ -250,13 +314,17 @@ async def chat(body: ChatIn, request: Request):
             (session_id,),
         ).fetchall()
 
-    system_prompt = build_system_prompt(page_context, condition)
-
     turn = sum(1 for r, _ in history if r == "user") + 1
     if turn > MAX_TURNS:
         raise HTTPException(429, "Turn limit reached")
 
     messages = [{"role": "system", "content": system_prompt}]
+    if page_context:
+        messages.append({
+            "role": "system",
+            "content": ("What the participant currently has on screen "
+                        "(updated each message):\n" + page_context),
+        })
     messages += [{"role": r, "content": c} for r, c in history]
     messages.append({"role": "user", "content": message})
 
@@ -270,6 +338,9 @@ async def chat(body: ChatIn, request: Request):
         "options": {
             "temperature": TEMPERATURE,
             "top_p": TOP_P,
+            "top_k": TOP_K,
+            "presence_penalty": PRESENCE_PENALTY,
+            "repeat_penalty": REPEAT_PENALTY,
             "seed": SEED,
             "num_ctx": NUM_CTX,
             "num_predict": MAX_REPLY_TOKENS,
@@ -303,9 +374,11 @@ async def chat(body: ChatIn, request: Request):
         conn.execute(
             "INSERT INTO messages (session_id, response_id, turn, role, content,"
             " created_at, latency_ms, model, gen_settings, prompt_tokens,"
-            " reply_tokens, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " reply_tokens, error, word_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, body.response_id, turn, "assistant", reply, now_iso(),
-             latency_ms, MODEL, json.dumps(settings), p_tok, r_tok, err),
+             latency_ms, MODEL, json.dumps(settings), p_tok, r_tok, err,
+             len(reply.split()) if reply else 0),
         )
         conn.commit()
 
@@ -314,4 +387,4 @@ async def chat(body: ChatIn, request: Request):
         raise HTTPException(502, "The model did not respond")
 
     return ChatOut(session_id=session_id, reply=reply, turn=turn,
-                   latency_ms=latency_ms, model=MODEL)
+                   latency_ms=latency_ms, model=MODEL, condition=condition)
