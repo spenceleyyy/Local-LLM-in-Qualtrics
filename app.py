@@ -182,7 +182,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    # Allow any request header. Listing them explicitly means one stray
+    # header in the survey JavaScript makes every request fail CORS with
+    # a bare "Load failed" in the browser and nothing in this log at all.
+    allow_headers=["*"],
 )
 
 

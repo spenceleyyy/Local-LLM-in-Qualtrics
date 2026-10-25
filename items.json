@@ -1,50 +1,64 @@
 {
   "_README": [
     "One entry per discussion question. The key is the item_id you set in",
-    "the Qualtrics JavaScript (ITEM_ID).",
+    "the Qualtrics JavaScript (ITEM_ID). Keys starting with _ are ignored.",
     "",
     "  question  - the stem, copied exactly as participants see it.",
     "  options   - the answer choices, copied exactly. Use [] for open text.",
-    "  correct   - the true answer. Used only for scoring and debriefing;",
-    "              it is never shown to the model.",
+    "  correct   - the true answer. Used only for your scoring and the",
+    "              debrief; it is never shown to the model.",
     "  targets   - which answer the model argues for, given what the",
     "              participant chose. Key = participant's answer,",
-    "              value = answer the model pushes. This is how you keep",
-    "              both conditions pushing the SAME alternative.",
-    "  default_target - used when the participant's answer isn't a key in",
-    "              'targets' (open text, 'other', a typo).",
+    "              value = answer the model pushes. Both conditions get",
+    "              the same target, so style stays the only difference.",
+    "  default_target - used when the participant's answer is not a key in",
+    "              'targets' (open text, 'other', a typo, a blank).",
     "",
-    "Pick targets deliberately. For a participant who is already correct,",
-    "the target is a plausible distractor (this is what makes the",
-    "manipulation unconditional). For a participant who is wrong, you can",
-    "either push them to the correct answer or to a second wrong answer -",
-    "that choice decides whether your design can detect corrected errors,",
-    "induced errors, or both. Decide it before collecting data."
+    "IMPORTANT: the keys inside 'targets' must match the choice text that",
+    "Qualtrics pipes over, character for character. If they do not match,",
+    "the server silently falls back to default_target. Check prior_answer",
+    "and target_answer in sessions.csv after your first pilot run."
   ],
 
   "item_01": {
-    "question": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
-    "options": ["5 cents", "10 cents", "11 cents", "1 cent"],
-    "correct": "5 cents",
+    "question": "You lift a suitcase from the floor to a table. In addition to the weight of the suitcase, select all of the following factors that determine the work done by the gravitational force on the suitcase. (1) whether you lift it directly up to the table or along a longer path (2) whether you lift it quickly or slowly (3) the height of the table above the floor",
+    "options": [
+      "(1) only",
+      "(3) only",
+      "(1) and (3) only",
+      "(2) and (3) only",
+      "(1), (2) and (3)"
+    ],
+    "correct": "(3) only",
+
+    "_targets_rationale": [
+      "Participant WRONG  -> model argues for the correct answer.",
+      "   This arm measures corrected errors.",
+      "Participant RIGHT  -> model argues for '(1) and (3) only', the",
+      "   path-dependence misconception, which is the most plausible",
+      "   distractor here. This arm measures induced errors.",
+      "Together these give you both quantities in one design. If you only",
+      "want one, change this map before collecting data, not after."
+    ],
     "targets": {
-      "5 cents": "10 cents",
-      "10 cents": "5 cents",
-      "11 cents": "5 cents",
-      "1 cent": "5 cents"
+      "(1) only": "(3) only",
+      "(3) only": "(1) and (3) only",
+      "(1) and (3) only": "(3) only",
+      "(2) and (3) only": "(3) only",
+      "(1), (2) and (3)": "(3) only"
     },
-    "default_target": "10 cents"
+    "default_target": "(3) only"
   },
 
-  "item_02": {
-    "question": "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
-    "options": ["5 minutes", "100 minutes", "20 minutes", "1 minute"],
-    "correct": "5 minutes",
+  "_TEMPLATE_copy_me_and_rename": {
+    "question": "Stem, exactly as participants see it.",
+    "options": ["Option A", "Option B", "Option C"],
+    "correct": "Option B",
     "targets": {
-      "5 minutes": "100 minutes",
-      "100 minutes": "5 minutes",
-      "20 minutes": "5 minutes",
-      "1 minute": "5 minutes"
+      "Option A": "Option B",
+      "Option B": "Option A",
+      "Option C": "Option B"
     },
-    "default_target": "100 minutes"
+    "default_target": "Option B"
   }
 }
