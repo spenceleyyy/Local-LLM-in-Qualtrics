@@ -4,22 +4,22 @@
     "the Qualtrics JavaScript (ITEM_ID). Keys starting with _ are ignored.",
     "",
     "  question  - the stem, copied exactly as participants see it.",
-    "  options   - the answer choices, copied exactly. Use [] for open text.",
-    "  correct   - the true answer. Used only for your scoring and the",
-    "              debrief; it is never shown to the model.",
-    "  targets   - which answer the model argues for, given what the",
-    "              participant chose. Key = participant's answer,",
-    "              value = answer the model pushes. Both conditions get",
-    "              the same target, so style stays the only difference.",
+    "  options   - the answer choices. Used for YOUR records and for leak",
+    "              detection. These are NOT shown to the model.",
+    "  correct   - the true answer. Never shown to the model.",
+    "  targets   - participant's answer -> the answer the model steers to.",
+    "  hints     - target answer -> the ABSTRACT claim the model argues.",
+    "              This is what the model actually sees. It never sees the",
+    "              option text, so it cannot quote it back. Write these at",
+    "              the level of a principle, not a conclusion: if the hint",
+    "              names which listed factors count, the model will too.",
     "  default_target - used when the participant's answer is not a key in",
     "              'targets' (open text, 'other', a typo, a blank).",
     "",
-    "IMPORTANT: the keys inside 'targets' must match the choice text that",
-    "Qualtrics pipes over, character for character. If they do not match,",
-    "the server silently falls back to default_target. Check prior_answer",
-    "and target_answer in sessions.csv after your first pilot run."
+    "IMPORTANT: keys inside 'targets' must match the choice text Qualtrics",
+    "pipes over, character for character, or the server falls back to",
+    "default_target. Check prior_answer in sessions.csv after a pilot run."
   ],
-
   "item_01": {
     "question": "You lift a suitcase from the floor to a table. In addition to the weight of the suitcase, select all of the following factors that determine the work done by the gravitational force on the suitcase. (1) whether you lift it directly up to the table or along a longer path (2) whether you lift it quickly or slowly (3) the height of the table above the floor",
     "options": [
@@ -30,7 +30,6 @@
       "(1), (2) and (3)"
     ],
     "correct": "(3) only",
-
     "_targets_rationale": [
       "Participant WRONG  -> model argues for the correct answer.",
       "   This arm measures corrected errors.",
@@ -47,12 +46,41 @@
       "(2) and (3) only": "(3) only",
       "(1), (2) and (3)": "(3) only"
     },
-    "default_target": "(3) only"
+    "default_target": "(3) only",
+    "hints": {
+      "(3) only": "The force in question belongs to a class whose effect over a journey is fixed by the start and end points alone. Argue from that principle. Do not say which of the listed factors it rules in or out - make them work that out.",
+      "(1) and (3) only": "Work is force acting over a distance, so the journey itself is part of the physical picture and a longer journey means more of it. Argue from that principle. Do not say which of the listed factors it rules in or out."
+    },
+    "_hints_note": [
+      "The model sees ONLY the hint for the target it is steering to, never",
+      "the option text and never the word 'only'. Rewrite a hint if replies",
+      "are still too revealing - that is the main dial you have."
+    ],
+    "giveaway_terms": [
+      "height of the table",
+      "the path taken",
+      "the path you take",
+      "longer path",
+      "quickly or slowly",
+      "how fast you",
+      "vertical displacement",
+      "change in height",
+      "height difference"
+    ],
+    "_giveaway_note": [
+      "Phrases that, if the model writes them, mean it has handed over the",
+      "answer in words even though it quoted no option. A reply containing",
+      "one is thrown away and regenerated. Add to this list whenever you",
+      "read a pilot transcript that gives too much away."
+    ]
   },
-
   "_TEMPLATE_copy_me_and_rename": {
     "question": "Stem, exactly as participants see it.",
-    "options": ["Option A", "Option B", "Option C"],
+    "options": [
+      "Option A",
+      "Option B",
+      "Option C"
+    ],
     "correct": "Option B",
     "targets": {
       "Option A": "Option B",

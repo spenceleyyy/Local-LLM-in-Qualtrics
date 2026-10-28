@@ -51,11 +51,17 @@ PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "0.5"))
 REPEAT_PENALTY = float(os.getenv("LLM_REPEAT_PENALTY", "1.1"))
 SEED = int(os.getenv("LLM_SEED", "42"))
 NUM_CTX = int(os.getenv("LLM_NUM_CTX", "8192"))
-MAX_REPLY_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+MAX_REPLY_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "100"))
+# Hard cap on sentences. Small models often ignore a length instruction,
+# so the reply is trimmed server-side as well. 0 disables trimming.
+MAX_SENTENCES = int(os.getenv("LLM_MAX_SENTENCES", "3"))
+# If a reply names an answer option, throw it away and generate again.
+# Prompts alone do not reliably stop a 9B model doing this.
+LEAK_RETRIES = int(os.getenv("LLM_LEAK_RETRIES", "2"))
 
 # Word budget written into both condition prompts. Identical by design.
-WORD_MIN = int(os.getenv("REPLY_WORD_MIN", "60"))
-WORD_MAX = int(os.getenv("REPLY_WORD_MAX", "90"))
+WORD_MIN = int(os.getenv("REPLY_WORD_MIN", "20"))
+WORD_MAX = int(os.getenv("REPLY_WORD_MAX", "45"))
 ITEMS_PATH = os.getenv("ITEMS_PATH", "items.json")
 # Qwen3.5 is a "thinking" model. Turning thinking off gives much faster,
 # cleaner replies for a chat task. Set LLM_THINK=true to enable it.
@@ -155,6 +161,10 @@ def db_connect():
         conn.execute("ALTER TABLE messages ADD COLUMN page_context TEXT")
     if "word_count" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN word_count INTEGER")
+    if "raw_reply" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN raw_reply TEXT")
+    if "named_option" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN named_option TEXT")
     scols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
     for c in ("item_id", "prior_answer", "target_answer"):
         if c not in scols:
@@ -189,6 +199,82 @@ app.add_middleware(
 )
 
 
+def names_option(text, item, target_answer, prior_answer=""):
+    """Did the reply point at a specific listed option? Returns what leaked.
+
+    The participant's OWN answer is exempt: quoting it back to them is
+    allowed and encouraged, and reveals nothing about the target. It is
+    stripped out before the other checks so its wording and its bracketed
+    numbers do not trip them.
+
+    Otherwise catches: an option quoted verbatim, a reference like "(3)" or
+    "option 3", an explicit does/doesn't-matter claim, and any phrase you
+    listed under giveaway_terms. Used both to regenerate the reply and to
+    log a manipulation check.
+    """
+    if not text:
+        return ""
+    hay = " ".join(text.split()).lower()
+
+    # The participant's own answer is allowed: take it out of the haystack
+    # so nothing inside it counts against the reply.
+    own = " ".join(str(prior_answer or "").split()).lower()
+    if len(own) >= 3:
+        hay = hay.replace(own, " ~theiranswer~ ")
+
+    # 1. an option quoted verbatim (longest first: "(3) only" sits inside
+    #    "(1) and (3) only", and we want the more specific match)
+    opts = [o for o in (item.get("options") or [])
+            if " ".join(str(o).split()).lower() != own]
+    if target_answer and target_answer not in opts:
+        opts.append(target_answer)
+    for opt in sorted(opts, key=lambda o: -len(str(o))):
+        needle = " ".join(str(opt).split()).lower()
+        if len(needle) >= 4 and needle in hay:
+            return str(opt)
+
+    # 2. a reference to a numbered item
+    for pat in (r"\(\s*\d\s*\)",
+                r"\b(?:option|factor|choice|item|answer)s?\s*#?\(?\s*\d",
+                r"\bnumber\s+(?:one|two|three|four|five|\d)\b"):
+        m = re.search(pat, hay)
+        if m:
+            return m.group(0).strip()
+
+    # 3. an explicit ruling-in or ruling-out
+    for pat in (r"\bonly\s+the\b", r"\bthe only\s+\w+\s+that\b",
+                r"\bdepends only on\b", r"\bdoes not (?:matter|affect|"
+                r"influence|change|determine)\b", r"\bhas no (?:effect|"
+                r"bearing|impact) on the\b", r"\bis irrelevant\b",
+                # "X matters, while Y does not" and its variants
+                r"\bmatters?,?\s+(?:while|whereas|but|and)\b",
+                r"\b(?:while|whereas|but)\s+the\s+[\w\s]{1,25}"
+                r"(?:does not|doesn't|has no)\b",
+                r"\bis (?:the|a) (?:only |sole )?(?:relevant|determining|"
+                r"deciding) (?:factor|one|thing)\b",
+                r"\bnot the\s+[\w\s]{1,20}\s+or the\b"):
+        m = re.search(pat, hay)
+        if m:
+            return m.group(0).strip()
+
+    # 4. phrases you listed yourself in items.json as giving it away
+    for term in (item.get("giveaway_terms") or []):
+        t = " ".join(str(term).split()).lower()
+        if t and t in hay:
+            return str(term)
+    return ""
+
+
+def trim_sentences(text, limit):
+    """Keep only the first `limit` sentences, cutting at a boundary."""
+    if limit <= 0 or not text:
+        return text
+    parts = re.findall(r"[^.!?]*[.!?]+[\")\u201d\u2019]*\s*|[^.!?]+$", text)
+    if len(parts) <= limit:
+        return text.strip()
+    return "".join(parts[:limit]).strip()
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -204,6 +290,8 @@ def gen_settings():
         "seed": SEED,
         "num_ctx": NUM_CTX,
         "num_predict": MAX_REPLY_TOKENS,
+        "max_sentences": MAX_SENTENCES,
+        "leak_retries": LEAK_RETRIES,
         "think": THINK,
         "word_budget": [WORD_MIN, WORD_MAX],
     }
@@ -219,6 +307,7 @@ class ChatIn(BaseModel):
     condition: Optional[str] = Field("", max_length=200)
     item_id: Optional[str] = Field("", max_length=100)
     prior_answer: Optional[str] = Field("", max_length=1000)
+    opening: Optional[bool] = False
     page_context: Optional[str] = ""
     message: str
 
@@ -230,6 +319,9 @@ class ChatOut(BaseModel):
     latency_ms: int
     model: str
     condition: str
+    # On the opening exchange, the first "user" line the model was
+    # responding to, so the widget can show it in the thread.
+    opening_user_text: Optional[str] = None
 
 
 # --------------------------------------------------------------------------
@@ -258,7 +350,8 @@ async def chat(body: ChatIn, request: Request):
         raise HTTPException(401, "Invalid key")
 
     message = body.message.strip()
-    if not message:
+    opening = bool(body.opening)
+    if not message and not opening:
         raise HTTPException(400, "Empty message")
     message = message[:MAX_MESSAGE_CHARS]
 
@@ -317,7 +410,12 @@ async def chat(body: ChatIn, request: Request):
             (session_id,),
         ).fetchall()
 
+    # The opening message is logged under its own role so you can filter it
+    # out in analysis, but the model must see it as an ordinary assistant turn.
     turn = sum(1 for r, _ in history if r == "user") + 1
+    history = [("assistant" if r == "assistant_opening" else
+                "user" if r == "user_prior" else r, c)
+               for r, c in history]
     if turn > MAX_TURNS:
         raise HTTPException(429, "Turn limit reached")
 
@@ -329,7 +427,18 @@ async def chat(body: ChatIn, request: Request):
                         "(updated each message):\n" + page_context),
         })
     messages += [{"role": r, "content": c} for r, c in history]
-    messages.append({"role": "user", "content": message})
+    # On the opening exchange the participant's unassisted answer IS the
+    # first user turn, so the model is replying to them rather than opening
+    # cold. Falls back to a bare instruction if no prior answer came through.
+    opening_user_text = None
+    if opening:
+        if prior_answer:
+            opening_user_text = "My answer is: " + prior_answer
+        else:
+            opening_user_text = "I have given my answer."
+        messages.append({"role": "user", "content": opening_user_text})
+    else:
+        messages.append({"role": "user", "content": message})
 
     # ---- call the model ----
     settings = gen_settings()
@@ -351,17 +460,41 @@ async def chat(body: ChatIn, request: Request):
     }
 
     t0 = time.perf_counter()
-    reply, err, p_tok, r_tok = "", None, None, None
+    reply, raw_reply, err, p_tok, r_tok = "", "", None, None, None
+    leaked, attempts = "", 0
     try:
-        async with gen_semaphore:
-            r = await http.post(f"{OLLAMA_URL}/api/chat", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        reply = data.get("message", {}).get("content", "")
-        # Safety net in case thinking text leaks into the content.
-        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.S).strip()
-        p_tok = data.get("prompt_eval_count")
-        r_tok = data.get("eval_count")
+        for attempt in range(LEAK_RETRIES + 1):
+            attempts = attempt + 1
+            body_payload = dict(payload)
+            if attempt:
+                # Previous try named an option. Say so and generate again
+                # with a fresh seed so we do not get the same text back.
+                body_payload["messages"] = payload["messages"] + [
+                    {"role": "assistant", "content": raw_reply},
+                    {"role": "user", "content":
+                     "You referred to one of the listed options, which you "
+                     "must never do. Say the same thing again without "
+                     "mentioning any option, number, or which listed item "
+                     "does or does not matter."},
+                ]
+                body_payload["options"] = dict(payload["options"])
+                body_payload["options"]["seed"] = SEED + attempt
+            async with gen_semaphore:
+                r = await http.post(f"{OLLAMA_URL}/api/chat",
+                                    json=body_payload)
+            r.raise_for_status()
+            data = r.json()
+            reply = data.get("message", {}).get("content", "")
+            # Safety net in case thinking text leaks into the content.
+            reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.S).strip()
+            raw_reply = reply
+            reply = trim_sentences(reply, MAX_SENTENCES)
+            p_tok = data.get("prompt_eval_count")
+            r_tok = data.get("eval_count")
+            leaked = names_option(reply, item, target_answer,
+                                  prior_answer)
+            if not leaked:
+                break
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -369,19 +502,27 @@ async def chat(body: ChatIn, request: Request):
     # ---- log both sides of the turn ----
     async with db_lock:
         conn.execute(
-            "INSERT INTO messages (session_id, response_id, turn, role, content,"
-            " created_at, error, page_context) VALUES (?,?,?,?,?,?,?,?)",
-            (session_id, body.response_id, turn, "user", message, user_ts, err,
-             page_context),
+            "INSERT INTO messages (session_id, response_id, turn, role,"
+            " content, created_at, error, page_context)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, body.response_id,
+             0 if opening else turn,
+             # "user_prior" = piped in from the earlier question, not typed
+             # here. Filter these out when counting participant messages.
+             "user_prior" if opening else "user",
+             opening_user_text if opening else message,
+             user_ts, err, page_context),
         )
         conn.execute(
             "INSERT INTO messages (session_id, response_id, turn, role, content,"
             " created_at, latency_ms, model, gen_settings, prompt_tokens,"
-            " reply_tokens, error, word_count)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (session_id, body.response_id, turn, "assistant", reply, now_iso(),
+            " reply_tokens, error, word_count, raw_reply, named_option)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, body.response_id, 0 if opening else turn,
+             "assistant_opening" if opening else "assistant", reply, now_iso(),
              latency_ms, MODEL, json.dumps(settings), p_tok, r_tok, err,
-             len(reply.split()) if reply else 0),
+             len(reply.split()) if reply else 0, raw_reply,
+             (leaked + f" [after {attempts} tries]") if leaked else ""),
         )
         conn.commit()
 
@@ -390,4 +531,5 @@ async def chat(body: ChatIn, request: Request):
         raise HTTPException(502, "The model did not respond")
 
     return ChatOut(session_id=session_id, reply=reply, turn=turn,
-                   latency_ms=latency_ms, model=MODEL, condition=condition)
+                   latency_ms=latency_ms, model=MODEL, condition=condition,
+                   opening_user_text=opening_user_text)
